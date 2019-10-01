@@ -1,11 +1,11 @@
-import tensorflow as tf
+import torch
 import numpy as np
 import ais
-import matplotlib
-matplotlib.use('PS')
 import matplotlib.pyplot as plt
 from scipy.stats import norm
-
+import ipdb
+import seaborn as sns
+sns.set()
 
 class Generator(object):
     def __init__(self, input_dim, output_dim):
@@ -30,14 +30,17 @@ def kde_logpdf(x, mu, sigma):
     # instead of summing it then taking the average of it, we simply keep things separately in a
     # matrix. log_mean_exp will run in the end of AIS method. and we will obtain a shape
     # [batch_size] instead of [batch_size*num_samples]
-
-    d = (x - mu) / sigma
-    e = -0.5 * tf.multiply(d, d)
-
-    z = tf.cast(tf.to_float(tf.shape(mu)[1]) *
-                tf.log(np.float32(sigma * np.sqrt(np.pi * 2.0))), tf.float32)
-
+#     print(x.)
+    d = (x.float() - mu.float())
+    d =  d / sigma
+    e = -0.5 * torch.pow(d, 2)
+    
+#     print(mu)
+    z = (mu.size(1) *
+        torch.log(sigma * np.sqrt(np.pi * 2.0))).float()
+    # ipdb.set_trace()
     return e - z
+
 
 generator = Generator(1, 1)
 
@@ -47,10 +50,9 @@ batch_size = 40
 num_samples = 10000
 x = np.linspace(norm.ppf(0.01, loc=3, scale=2), norm.ppf(0.99, loc=3, scale=2), batch_size)
 p1 = norm.pdf(x, loc=3, scale=2)
-
-x_ph = tf.placeholder(tf.float32, [None, 1], name='x')
-model = ais.AIS(x_ph, lambda x, z: kde_logpdf(x, generator(z), 1.5),
-                  {'input_dim': 1, 'output_dim': 1, 'batch_size': batch_size},
+x = torch.from_numpy(x)
+model = ais.AIS(x, lambda x, z: kde_logpdf(x, generator(z), torch.ones(1)*1.5),
+        {'input_dim': 1, 'output_dim': 1, 'batch_size': batch_size},
                   num_samples)
 
 xx = np.reshape(x, [batch_size, 1])
@@ -58,16 +60,13 @@ xx = np.reshape(x, [batch_size, 1])
 schedule = ais.get_schedule(5, rad=4)
 
 #print(schedule)
-target = tf.tile(tf.expand_dims(model.x, 0), [model.num_samples, 1,1])
-model.x = tf.reshape(target, [model.num_samples * model.batch_size, model.dims['output_dim']])
+target = model.x[...,None,None].repeat(1, model.num_samples, 1).permute(1,0,2)
+model.x = target.reshape( 
+        model.num_samples * model.batch_size, model.dims['output_dim'])
 
-lld = model.ais(tf.distributions.Normal(loc=[0.], scale=[1.]).sample(num_samples*batch_size),
+p2 = model.ais(ais.standard_gaussian([num_samples*batch_size,1]).sample(),
                 schedule)
-sess = tf.Session()
-sess.run(tf.global_variables_initializer())
-
-p2 = sess.run([lld], {x_ph: xx})
 plt.plot(x, p1)
-plt.plot(x, np.exp(p2[0]))
-# plt.show()
+# ipdb.set_trace()
+plt.plot(x, np.exp(p2))
 plt.savefig('test.png')

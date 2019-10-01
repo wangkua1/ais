@@ -1,17 +1,51 @@
-import tensorflow as tf
+import matplotlib.pylab as plt
 import numpy as np
+from scipy.stats import norm
+import seaborn as sns
+import torch
 from hmc import *
+import ipdb
 
 def get_schedule(num, rad=4):
     if num == 1:
         return np.array([0.0, 1.0])
     t = np.linspace(-rad, rad, num)
     s = 1.0 / (1.0 + np.exp(-t))
-    return (s - np.min(s)) / (np.max(s) - np.min(s))
+    return ((s - np.min(s)) / (np.max(s) - np.min(s))).astype('float32')
 
 def log_mean_exp(x, axis=None):
-    m = tf.reduce_max(x, axis=axis, keep_dims=True)
-    return m + tf.log(tf.reduce_mean(tf.exp(x - m), axis=axis, keep_dims=True))
+    assert axis is not None
+    m = torch.max(x, dim=axis, keepdim=True)[0]
+    return m + torch.log(torch.mean(
+        torch.exp(x - m), dim=axis, keepdim=True))
+
+
+def flatten_sum(logps):
+    while len(logps.size()) > 1:
+        logps = logps.sum(dim=-1)
+    return logps
+
+def standard_gaussian(shape):
+    mean, logsd = [torch.FloatTensor(*shape).fill_(0.) for _ in range(2)]
+    return gaussian_diag(mean, logsd)
+
+
+def gaussian_diag(mean, logsd):
+    class o(object):
+        Log2PI = float(np.log(2 * np.pi))
+        pass
+
+        def logps(x):
+            return  -0.5 * (o.Log2PI + 2. * logsd + ((x - mean) ** 2) / torch.exp(2. * logsd))
+
+        def sample():
+            eps = torch.zeros_like(mean).normal_()
+            return mean + torch.exp(logsd) * eps
+
+    o.logp = lambda x: flatten_sum(o.logps(x))
+    return o
+
+
 
 class AIS(object):
     def __init__(self, x_ph, log_likelihood_fn, dims, num_samples,
@@ -48,10 +82,8 @@ class AIS(object):
         self.num_samples = num_samples
 
         self.z_shape = [dims['batch_size'] * self.num_samples, dims['input_dim']]
-
-        tfd = tf.contrib.distributions
-        self.prior = tfd.MultivariateNormalDiag(loc=tf.zeros(self.z_shape),
-                        scale_diag=tf.ones(self.z_shape))
+#         print(self.z_shape)
+        self.prior = standard_gaussian(self.z_shape)
 
         self.batch_size = dims['batch_size']
         self.x = x_ph
@@ -68,13 +100,13 @@ class AIS(object):
 
     def log_f_i(self, z, t):
 
-        return tf.reshape(- self.energy_fn(z, t), [self.num_samples, self.batch_size])
+        return (- self.energy_fn(z, t)).view(self.num_samples, self.batch_size)
 
     def energy_fn(self, z, t):
-
-        e = self.prior.log_prob(z) + t * \
-            tf.reshape(self.log_likelihood_fn(self.x, z),
-                       [self.num_samples * self.batch_size])
+#         print(self.x.shape)
+        e = self.prior.logp(z) + t * \
+            self.log_likelihood_fn(self.x, z).view(
+                       self.num_samples * self.batch_size)
 
         return -e
 
@@ -84,32 +116,26 @@ class AIS(object):
             :param schedule: temperature schedule i.e. `p(z)p(x|z)^t`
         """
 
-        index_summation = (tf.constant(0),
-                           tf.zeros([self.num_samples, self.batch_size]),
-                           tf.cast(z, tf.float32),
-                           self.stepsize,
-                           self.avg_acceptance_rate
-                           )
+        
 
-        items = tf.unstack(tf.convert_to_tensor([[i, t0, t1] for i, (t0, t1) in enumerate(zip(schedule[:-1], schedule[1:]))]))
+        items = torch.from_numpy(np.array([[i, t0, t1] for i, (t0, t1) in 
+                                      enumerate(zip(schedule[:-1], schedule[1:]))]))
 
         def condition(index, summation, z, stepsize, avg_acceptance_rate):
-            return tf.less(index, len(schedule)-1)
+            return index < len(schedule)-1
 
         def body(index, w, z, stepsize, avg_acceptance_rate):
-            item = tf.gather(items, index)
-            t0 = tf.gather(item, 1)
-            t1 = tf.gather(item, 2)
+            item = items[index]
+            t0 = item[1]
+            t1 = item[2]
 
             new_u = self.log_f_i(z, t1)
             prev_u = self.log_f_i(z, t0)
-
-            w = tf.add(w, new_u - prev_u)
+            w = w + (new_u - prev_u)
 
             def run_energy(z):
-                e = self.energy_fn(z, t1)
-                with tf.control_dependencies([e]):
-                    return e
+                return self.energy_fn(z, t1)
+                
 
             # New step:
             accept, final_pos, final_vel = hmc_move(
@@ -133,8 +159,16 @@ class AIS(object):
                 avg_acceptance_slowness=self.avg_acceptance_slowness
             )
 
-            return tf.add(index,1), w, new_z, new_stepsize, new_acceptance_rate
+            return index+1, w, new_z, new_stepsize, new_acceptance_rate
 
-        i, w, _, _, _ = tf.while_loop(condition, body, index_summation, parallel_iterations=1, swap_memory=True)
+        index = 0
+        w =torch.zeros([self.num_samples, self.batch_size])
+        z = z.float()
+        old_z = z.clone()
+        stepsize = self.stepsize
+        avg_acceptance_rate = self.avg_acceptance_rate
+        while index < len(schedule) -1:
+            index, w, z, stepsize, avg_acceptance_rate = body(index, w, z, stepsize, avg_acceptance_rate)
 
-        return tf.squeeze(log_mean_exp(w, axis=0), axis=0)
+        return torch.logsumexp(w,axis=0).squeeze() - torch.log(torch.ones(1) * w.size(0))
+
